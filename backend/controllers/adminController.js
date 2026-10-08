@@ -5,6 +5,10 @@ const Institution = require('../models/Institution');
 const City = require('../models/City');
 const Match = require('../models/Match');
 const { rescanAllMatches } = require('../services/aiMatching');
+const { isValidObjectId, cleanString } = require('../utils/validators');
+
+const ROLES = ['usuario', 'institucion', 'admin'];
+const MODERATION_STATUSES = ['pendiente', 'aprobado', 'rechazado'];
 
 // @route GET /api/admin/users
 const listUsers = asyncHandler(async (req, res) => {
@@ -13,13 +17,35 @@ const listUsers = asyncHandler(async (req, res) => {
 });
 
 // @route PUT /api/admin/users/:id  -> activar/desactivar o cambiar rol
+// Se valida el rol (antes se guardaba cualquier texto) y un administrador
+// no puede desactivarse ni quitarse el rol a si mismo (evita quedarse sin
+// ningun administrador por error).
 const updateUser = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) {
+    res.status(404);
+    throw new Error('Usuario no encontrado');
+  }
   const { active, role } = req.body;
   const update = {};
   if (typeof active === 'boolean') update.active = active;
-  if (role) update.role = role;
+  if (role !== undefined) {
+    if (!ROLES.includes(role)) {
+      res.status(400);
+      throw new Error('Rol no válido');
+    }
+    update.role = role;
+  }
 
-  const user = await User.findByIdAndUpdate(req.params.id, update, { new: true }).select('-password');
+  if (String(req.params.id) === String(req.user._id) && (update.active === false || (update.role && update.role !== 'admin'))) {
+    res.status(400);
+    throw new Error('No puedes desactivar ni cambiar el rol de tu propia cuenta de administrador.');
+  }
+
+  const user = await User.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }).select('-password');
+  if (!user) {
+    res.status(404);
+    throw new Error('Usuario no encontrado');
+  }
   res.json(user);
 });
 
@@ -73,19 +99,32 @@ const globalStats = asyncHandler(async (req, res) => {
 // @route GET /api/admin/moderation -> reportes pendientes de moderar
 const pendingItems = asyncHandler(async (req, res) => {
   const items = await Item.find({ 'moderation.status': 'pendiente' })
-    .populate('city category user')
+    .select('-textVector -imageHash -imageColorProfile')
+    .populate('city category')
+    .populate('user', 'name email')
     .sort('-createdAt');
   res.json(items);
 });
 
 // @route PUT /api/admin/moderation/:id -> aprobar/rechazar contenido
 const moderateItem = asyncHandler(async (req, res) => {
-  const { status, reason } = req.body; // status: aprobado | rechazado
-  const item = await Item.findByIdAndUpdate(
-    req.params.id,
-    { moderation: { status, reason, reviewedBy: req.user._id } },
-    { new: true }
-  );
+  const { status } = req.body; // status: aprobado | rechazado | pendiente
+  if (!MODERATION_STATUSES.includes(status)) {
+    res.status(400);
+    throw new Error('Estado de moderación no válido');
+  }
+  const reason = cleanString(req.body.reason, 300);
+  const item = isValidObjectId(req.params.id)
+    ? await Item.findByIdAndUpdate(
+      req.params.id,
+      { moderation: { status, reason, reviewedBy: req.user._id } },
+      { new: true }
+    ).select('-textVector -imageHash -imageColorProfile')
+    : null;
+  if (!item) {
+    res.status(404);
+    throw new Error('Reporte no encontrado');
+  }
   res.json(item);
 });
 

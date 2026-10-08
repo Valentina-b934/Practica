@@ -2,6 +2,38 @@ const asyncHandler = require('express-async-handler');
 const Match = require('../models/Match');
 const Item = require('../models/Item');
 const Notification = require('../models/Notification');
+const { isValidObjectId } = require('../utils/validators');
+const { isValidMatchScore, isChatEnabled, toPercent } = require('../utils/matchRules');
+const { shortName } = require('./itemController');
+
+// Solo el nombre del otro usuario: nunca su correo ni su telefono
+const ITEM_POPULATE = (path) => ({
+  path,
+  select: '-textVector -imageHash -imageColorProfile',
+  populate: ['city', 'category', { path: 'user', select: 'name' }],
+});
+
+function serializeMatch(match) {
+  const obj = match.toObject();
+  for (const key of ['lostItem', 'foundItem']) {
+    if (obj[key]?.user && typeof obj[key].user === 'object') {
+      obj[key].user = { _id: obj[key].user._id, name: shortName(obj[key].user.name) };
+    }
+    if (obj[key]) delete obj[key].moderation;
+  }
+  obj.percent = toPercent(match.score);
+  obj.chatAvailable = isChatEnabled(match);
+  return obj;
+}
+
+async function loadMatch(req, res) {
+  const match = isValidObjectId(req.params.id) ? await Match.findById(req.params.id).populate('lostItem foundItem') : null;
+  if (!match || !match.lostItem || !match.foundItem) {
+    res.status(404);
+    throw new Error('Coincidencia no encontrada');
+  }
+  return match;
+}
 
 /**
  * BUG DE SEGURIDAD CORREGIDO:
@@ -30,30 +62,21 @@ function assertUserIsInvolved(req, res, match) {
 
 // @route GET /api/matches/item/:itemId  -> coincidencias sugeridas para un reporte
 /**
- * BUG DE PRIVACIDAD CORREGIDO:
- * Este endpoint solo exigia `protect` (estar logueado), pero no
- * verificaba que el usuario tuviera alguna relacion con el reporte
- * consultado. Eso permitia que CUALQUIER usuario autenticado del
- * sistema consultara `/api/matches/item/:itemId` para el reporte de
- * OTRA persona (por ejemplo, abriendo el detalle de un reporte publico
- * ajeno) y viera el desglose completo de sus coincidencias de IA: foto,
- * descripcion, ciudad y porcentaje de similitud del objeto de la otra
- * parte involucrada, sin tener ninguna relacion con ese reporte.
- *
- * Ahora la visibilidad se limita asi:
+ * Visibilidad:
  *   - El dueño del reporte, un administrador, o el personal de la
  *     institucion asociada al reporte -> ven TODAS las coincidencias
- *     sugeridas para ese reporte (comportamiento normal de "Mis
- *     reportes" / panel de institucion).
- *   - Cualquier otro usuario -> solo puede ver, de esa lista, las
- *     coincidencias en las que EL MISMO participa como dueño del objeto
- *     contrario (porque entro a este reporte desde una coincidencia que
- *     le fue notificada a el). Nunca ve coincidencias de terceros con
- *     quienes no tiene ninguna relacion.
+ *     validas sugeridas para ese reporte.
+ *   - Cualquier otro usuario -> solo las coincidencias en las que EL MISMO
+ *     participa como dueño del objeto contrario. Nunca ve coincidencias de
+ *     terceros con quienes no tiene ninguna relacion.
  *   - Si no aplica ninguno de los casos anteriores, se responde 403.
+ *
+ * Solo se devuelven coincidencias VALIDAS (> 70 %). Las que existieran en
+ * la base de datos con un porcentaje menor o igual (por ejemplo, creadas
+ * con un umbral antiguo) no se muestran a los usuarios.
  */
 const getMatchesForItem = asyncHandler(async (req, res) => {
-  const item = await Item.findById(req.params.itemId);
+  const item = isValidObjectId(req.params.itemId) ? await Item.findById(req.params.itemId) : null;
   if (!item) {
     res.status(404);
     throw new Error('Reporte no encontrado');
@@ -68,11 +91,13 @@ const getMatchesForItem = asyncHandler(async (req, res) => {
     String(item.institution) === String(req.user.institution);
 
   let matches = await Match.find({
-    $or: [{ lostItem: req.params.itemId }, { foundItem: req.params.itemId }],
+    $or: [{ lostItem: item._id }, { foundItem: item._id }],
   })
-    .populate({ path: 'lostItem', populate: ['city', 'category', { path: 'user', select: '-password' }] })
-    .populate({ path: 'foundItem', populate: ['city', 'category', { path: 'user', select: '-password' }] })
+    .populate(ITEM_POPULATE('lostItem'))
+    .populate(ITEM_POPULATE('foundItem'))
     .sort('-score');
+
+  matches = matches.filter((m) => m.lostItem && m.foundItem && isValidMatchScore(m.score));
 
   if (!isOwner && !isAdmin && !isInstitutionStaff) {
     matches = matches.filter((m) => {
@@ -87,17 +112,18 @@ const getMatchesForItem = asyncHandler(async (req, res) => {
     }
   }
 
-  res.json(matches);
+  res.json(matches.map(serializeMatch));
 });
 
 // @route POST /api/matches/:id/confirm  -> el usuario confirma que SI es su objeto
 const confirmMatch = asyncHandler(async (req, res) => {
-  const match = await Match.findById(req.params.id).populate('lostItem foundItem');
-  if (!match) {
-    res.status(404);
-    throw new Error('Coincidencia no encontrada');
-  }
+  const match = await loadMatch(req, res);
   assertUserIsInvolved(req, res, match);
+
+  if (!isValidMatchScore(match.score)) {
+    res.status(400);
+    throw new Error('Esta coincidencia no supera el 70 % de similitud y no puede confirmarse.');
+  }
 
   match.status = 'confirmada_usuario';
   await match.save();
@@ -105,33 +131,40 @@ const confirmMatch = asyncHandler(async (req, res) => {
   await Item.findByIdAndUpdate(match.lostItem._id, { status: 'en_proceso' });
   await Item.findByIdAndUpdate(match.foundItem._id, { status: 'en_proceso' });
 
-  // Notifica a la institucion asociada (si existe) para validar la entrega
-  if (match.foundItem.institution) {
-    // Se podria buscar el usuario institucional; se deja como notificacion general
-  }
-
-  res.json({ message: 'Coincidencia confirmada. Inicia el proceso de recuperacion.', match });
+  res.json({ message: 'Coincidencia confirmada. Inicia el proceso de recuperacion.', match: { _id: match._id, status: match.status } });
 });
 
-// @route POST /api/matches/:id/reject
+// @route POST /api/matches/:id/reject  -> al rechazarla, el chat se cierra
 const rejectMatch = asyncHandler(async (req, res) => {
-  const match = await Match.findById(req.params.id).populate('lostItem foundItem');
-  if (!match) {
-    res.status(404);
-    throw new Error('Coincidencia no encontrada');
-  }
+  const match = await loadMatch(req, res);
   assertUserIsInvolved(req, res, match);
   match.status = 'rechazada';
   await match.save();
-  res.json({ message: 'Coincidencia rechazada', match });
+  res.json({ message: 'Coincidencia rechazada', match: { _id: match._id, status: match.status } });
 });
 
 // @route POST /api/matches/:id/validate -> la institucion valida la entrega fisica
+/**
+ * BUG DE AUTORIZACION CORREGIDO: antes CUALQUIER cuenta con rol
+ * "institucion" podia marcar como recuperado un objeto de OTRA institucion
+ * (o sin institucion) solo conociendo el id de la coincidencia. Ahora solo
+ * puede hacerlo el personal de la institucion asociada a alguno de los dos
+ * reportes, o un administrador.
+ */
 const validateMatchByInstitution = asyncHandler(async (req, res) => {
-  const match = await Match.findById(req.params.id).populate('lostItem foundItem');
-  if (!match) {
-    res.status(404);
-    throw new Error('Coincidencia no encontrada');
+  const match = await loadMatch(req, res);
+
+  if (req.user.role !== 'admin') {
+    const myInstitution = String(req.user.institution || '');
+    const related = [match.lostItem.institution, match.foundItem.institution].filter(Boolean).map(String);
+    if (!myInstitution || !related.includes(myInstitution)) {
+      res.status(403);
+      throw new Error('Solo la institución asociada a este objeto puede validar la entrega.');
+    }
+  }
+  if (match.status === 'rechazada' || !isValidMatchScore(match.score)) {
+    res.status(400);
+    throw new Error('No se puede validar la entrega de una coincidencia rechazada o no válida.');
   }
 
   match.status = 'validada_institucion';
@@ -149,7 +182,7 @@ const validateMatchByInstitution = asyncHandler(async (req, res) => {
     relatedMatch: match._id,
   });
 
-  res.json({ message: 'Entrega validada, objeto marcado como recuperado', match });
+  res.json({ message: 'Entrega validada, objeto marcado como recuperado', match: { _id: match._id, status: match.status } });
 });
 
 module.exports = { getMatchesForItem, confirmMatch, rejectMatch, validateMatchByInstitution };

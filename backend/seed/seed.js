@@ -1,36 +1,44 @@
 /**
- * Script de datos iniciales: ciudades principales de Colombia,
- * categorias comunes de objetos, un usuario administrador y una
- * institucion de ejemplo (UTS).
+ * Script de datos iniciales: municipios de Colombia, las 5 categorias
+ * oficiales de objetos, un usuario administrador y una institucion de
+ * ejemplo (UTS).
  *
  * Ejecutar con: npm run seed
+ *
+ * Credenciales iniciales: se toman de SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD
+ * y SEED_INSTITUTION_EMAIL / SEED_INSTITUTION_PASSWORD. Como el inicio de
+ * sesion ahora pide un codigo OTP por correo, el correo del administrador
+ * debe ser un buzon REAL al que tengas acceso. En produccion estas
+ * variables son obligatorias (no se usan contraseñas de demostracion).
  */
 const dotenv = require('dotenv');
 dotenv.config();
 const connectDB = require('../config/db');
 const City = require('../models/City');
-const Category = require('../models/Category');
 const User = require('../models/User');
 const Institution = require('../models/Institution');
 const colombiaData = require('./colombiaData');
+const { migrateCategories } = require('./migrateCategories');
+const { validatePasswordPolicy } = require('../utils/validators');
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+function seedCredential(emailVar, passVar, demoEmail, demoPass) {
+  const email = process.env[emailVar] || (isProduction ? null : demoEmail);
+  const password = process.env[passVar] || (isProduction ? null : demoPass);
+  if (!email || !password) {
+    throw new Error(`Define ${emailVar} y ${passVar} en el entorno para ejecutar el seed en produccion.`);
+  }
+  const policyError = validatePasswordPolicy(password);
+  if (policyError) throw new Error(`${passVar}: ${policyError}`);
+  return { email: email.toLowerCase().trim(), password };
+}
 
 // Convierte la lista agrupada por departamento en una lista plana
 // { name, department } que es lo que espera el modelo City.
 const cities = colombiaData.flatMap((dep) =>
   dep.cities.map((cityName) => ({ name: cityName, department: dep.department }))
 );
-
-const categories = [
-  { name: 'Documentos', icon: 'bi-file-earmark-text' },
-  { name: 'Celulares y tecnología', icon: 'bi-phone' },
-  { name: 'Billeteras y dinero', icon: 'bi-wallet2' },
-  { name: 'Llaves', icon: 'bi-key' },
-  { name: 'Mochilas y bolsos', icon: 'bi-bag' },
-  { name: 'Gafas', icon: 'bi-eyeglasses' },
-  { name: 'Ropa y accesorios', icon: 'bi-person-badge' },
-  { name: 'Mascotas', icon: 'bi-heart' },
-  { name: 'Otros', icon: 'bi-box-seam' },
-];
 
 async function run() {
   await connectDB();
@@ -55,35 +63,41 @@ async function run() {
   }
   const bucaramanga = cityDocs['Bucaramanga|Santander'];
 
-  console.log('Sembrando categorias...');
-  for (const c of categories) {
-    await Category.findOneAndUpdate({ name: c.name }, c, { upsert: true, new: true });
-  }
+  console.log('Sembrando categorias oficiales (Billeteras, Gafas, Carteras, Documentos, Dispositivos)...');
+  await migrateCategories();
+
+  const adminCred = seedCredential('SEED_ADMIN_EMAIL', 'SEED_ADMIN_PASSWORD', 'admin@objetosperdidos.co', 'Admin1234');
+  const instCred = seedCredential('SEED_INSTITUTION_EMAIL', 'SEED_INSTITUTION_PASSWORD', 'uts@objetosperdidos.co', 'Uts12345');
 
   console.log('Creando usuario administrador...');
-  let admin = await User.findOne({ email: 'admin@objetosperdidos.co' });
+  // BUG CORREGIDO: antes se usaba cityDocs['Bucaramanga'], pero el cache
+  // se indexa por "nombre|departamento", asi que esa clave no existia y en
+  // una base vacia el seed fallaba con "Cannot read properties of undefined".
+  let admin = await User.findOne({ email: adminCred.email });
   if (!admin) {
     admin = await User.create({
       name: 'Administrador General',
-      email: 'admin@objetosperdidos.co',
-      password: 'Admin1234',
+      email: adminCred.email,
+      password: adminCred.password,
       role: 'admin',
-      city: cityDocs['Bucaramanga']._id,
+      emailVerified: true,
+      city: bucaramanga._id,
     });
-    console.log('   -> admin@objetosperdidos.co / Admin1234');
+    console.log(`   -> ${adminCred.email}${isProduction ? '' : ` / ${adminCred.password}`}`);
   }
 
   console.log('Creando institucion de ejemplo (UTS)...');
-  let institutionUser = await User.findOne({ email: 'uts@objetosperdidos.co' });
+  let institutionUser = await User.findOne({ email: instCred.email });
   if (!institutionUser) {
     institutionUser = await User.create({
       name: 'UTS - Objetos Perdidos',
-      email: 'uts@objetosperdidos.co',
-      password: 'Uts12345',
+      email: instCred.email,
+      password: instCred.password,
       role: 'institucion',
-      city: cityDocs['Bucaramanga']._id,
+      emailVerified: true,
+      city: bucaramanga._id,
     });
-    console.log('   -> uts@objetosperdidos.co / Uts12345');
+    console.log(`   -> ${instCred.email}${isProduction ? '' : ` / ${instCred.password}`}`);
   }
 
   let institution = await Institution.findOne({ name: 'UTS - Sede Bucaramanga' });
@@ -91,7 +105,7 @@ async function run() {
     institution = await Institution.create({
       name: 'UTS - Sede Bucaramanga',
       type: 'universidad',
-      city: cityDocs['Bucaramanga']._id,
+      city: bucaramanga._id,
       address: 'Cra 27 Calle 9, Bucaramanga',
       contactEmail: 'objetosperdidos@uts.edu.co',
       adminUser: institutionUser._id,

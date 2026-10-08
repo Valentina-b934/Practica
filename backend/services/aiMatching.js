@@ -31,11 +31,11 @@ const Notification = require('../models/Notification');
 const { cosineSimilarity, fieldSimilarity } = require('./textAnalysis');
 const { imageSimilarity } = require('./imageAnalysis');
 
-// Umbral por defecto: 0.90 (90%), tal como lo exige la regla de negocio del
-// proyecto ("cuando la IA encuentre mas de un 90% de similitud entre las
-// caracteristicas de imagen y descripcion, notificar al usuario").
-// Se puede ajustar por entorno (MATCH_THRESHOLD en .env) sin tocar codigo.
-const THRESHOLD = parseFloat(process.env.MATCH_THRESHOLD || '0.90');
+// Umbral de coincidencia: una coincidencia es valida solo si su porcentaje
+// es ESTRICTAMENTE MAYOR que 70 % (ver utils/matchRules.js). El calculo del
+// score (pesos, texto, imagen, color, marca, ubicacion) no cambia.
+const { MATCH_THRESHOLD_PERCENT, isValidMatchScore } = require('../utils/matchRules');
+const THRESHOLD = MATCH_THRESHOLD_PERCENT / 100;
 
 const WEIGHTS_WITH_IMAGE = { text: 0.22, image: 0.25, category: 0.13, color: 0.10, brand: 0.10, location: 0.20 };
 const WEIGHTS_WITHOUT_IMAGE = { text: 0.30, category: 0.18, color: 0.14, brand: 0.13, location: 0.25 };
@@ -106,7 +106,7 @@ async function findMatchesForItem(newItem) {
 
   for (const candidate of candidates) {
     const { score, textScore, imageScore, colorScore, brandScore, locationScore, categoryMatch } = calculateScore(newItem, candidate);
-    if (score >= THRESHOLD) {
+    if (isValidMatchScore(score)) {
       const lostItem = newItem.type === 'perdido' ? newItem : candidate;
       const foundItem = newItem.type === 'encontrado' ? newItem : candidate;
 

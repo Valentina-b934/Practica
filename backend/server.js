@@ -3,11 +3,15 @@ const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const morgan = require('morgan');
+const helmet = require('helmet');
 
 dotenv.config();
 
 const connectDB = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
+const { sanitizeRequest } = require('./middleware/sanitize');
+const { apiLimiter } = require('./middleware/rateLimiters');
+const { UPLOAD_DIR } = require('./middleware/upload');
 
 const authRoutes = require('./routes/authRoutes');
 const itemRoutes = require('./routes/itemRoutes');
@@ -19,9 +23,35 @@ const adminRoutes = require('./routes/adminRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const messageRoutes = require('./routes/messageRoutes');
 
-connectDB();
+/**
+ * Comprobaciones de seguridad al arrancar: en produccion el servidor NO
+ * inicia con una clave JWT debil o de ejemplo (cualquiera que la conozca
+ * podria fabricar tokens de administrador).
+ */
+function checkSecurityConfig() {
+  const secret = process.env.JWT_SECRET || '';
+  const weak = secret.length < 32 || /cambia_esta_clave/i.test(secret);
+  if (process.env.NODE_ENV === 'production') {
+    if (weak) throw new Error('JWT_SECRET debe tener al menos 32 caracteres aleatorios en produccion.');
+    if (!process.env.CLIENT_URL) throw new Error('CLIENT_URL es obligatoria en produccion.');
+  } else if (weak) {
+    console.warn('⚠️  JWT_SECRET es debil o de ejemplo. Genera una con: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
+  }
+}
+checkSecurityConfig();
 
 const app = express();
+
+// Render (y la mayoria de hostings) ponen un proxy delante de la app: sin
+// esto, req.ip seria la IP del proxy y el rate limiting trataria a todos
+// los usuarios como si fueran una sola persona.
+const trustProxy = process.env.TRUST_PROXY ?? (process.env.NODE_ENV === 'production' ? '1' : '');
+if (trustProxy) app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
+
+// Cabeceras HTTP de seguridad (nosniff, HSTS, frameguard, sin X-Powered-By...).
+// crossOriginResourcePolicy "cross-origin" porque el frontend (otro dominio)
+// necesita mostrar las fotos servidas desde /uploads.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // Live Server (VS Code) puede servir en distintos puertos y en
 // "localhost" o "127.0.0.1" indistintamente; para el navegador son
@@ -72,12 +102,33 @@ app.use(cors({
     callback(new Error(`Origen no permitido por CORS: ${origin}`));
   },
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan('dev'));
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+app.use(sanitizeRequest);
 
-// Archivos estaticos (fotografias subidas)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Los logs no deben guardar tokens: se ocultan los de /reset-password/:token
+morgan.token('safe-url', (req) => req.originalUrl.replace(/(reset-password\/)[^/?]+/, '$1[oculto]'));
+if (process.env.NODE_ENV !== 'test') {
+  app.use(morgan(':method :safe-url :status :response-time ms - :res[content-length]'));
+}
+
+// Archivos estaticos (fotografias subidas). Solo se sirven imagenes; las
+// cabeceras impiden que el navegador "adivine" otro tipo de contenido o
+// ejecute algo, aunque alguien lograra subir un archivo raro.
+app.use(
+  '/uploads',
+  (req, res, next) => {
+    if (!/^\/[\w-]+\.(jpe?g|png|webp)$/i.test(req.path)) {
+      return res.status(404).end();
+    }
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Content-Security-Policy', "default-src 'none'; img-src 'self'; sandbox");
+    next();
+  },
+  express.static(UPLOAD_DIR, { dotfiles: 'deny', index: false, fallthrough: false })
+);
+
+app.use('/api', apiLimiter);
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'Objetos Perdidos IA API' }));
 
@@ -94,5 +145,12 @@ app.use('/api/messages', messageRoutes);
 app.use(notFound);
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`));
+// Solo se conecta y escucha cuando se ejecuta directamente (npm start);
+// las pruebas automaticas importan `app` sin abrir un puerto.
+if (require.main === module) {
+  connectDB();
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`));
+}
+
+module.exports = app;

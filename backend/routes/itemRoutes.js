@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const upload = require('../middleware/upload');
-const { protect } = require('../middleware/auth');
+const { protect, optionalAuth } = require('../middleware/auth');
+const { reportCreateLimiter } = require('../middleware/rateLimiters');
 const {
   createLostItem,
   createFoundItem,
@@ -14,10 +15,10 @@ const {
 
 router.get('/', listItems); // publico: buscar/consultar coincidencias
 router.get('/mine', protect, myItems);
-router.get('/:id', getItem);
+router.get('/:id', optionalAuth, getItem);
 
-router.post('/perdido', protect, upload.uploadImage, createLostItem);
-router.post('/encontrado', protect, upload.uploadImage, createFoundItem);
+router.post('/perdido', protect, reportCreateLimiter, upload.uploadImage, createLostItem);
+router.post('/encontrado', protect, reportCreateLimiter, upload.uploadImage, createFoundItem);
 
 router.put('/:id/status', protect, updateItemStatus);
 router.delete('/:id', protect, deleteItem);
