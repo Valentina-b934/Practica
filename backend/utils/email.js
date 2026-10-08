@@ -20,6 +20,11 @@
  * Los controladores capturan ese error y responden 503 con un mensaje
  * honesto, nunca "correo enviado".
  *
+ * PROVEEDOR HTTP (Brevo): algunos hostings gratuitos, como Render Free,
+ * bloquean los puertos SMTP (25, 465, 587). Si defines BREVO_API_KEY, el
+ * correo se envia por la API HTTPS de Brevo (puerto 443) en vez de SMTP.
+ * El remitente de EMAIL_FROM debe estar verificado en Brevo (Senders).
+ *
  * Unica excepcion, SOLO para desarrollo local: EMAIL_DEV_FALLBACK=true con
  * NODE_ENV distinto de "production" imprime el correo en la consola del
  * backend. Esa variable se ignora por completo en produccion.
@@ -36,8 +41,34 @@ class EmailError extends Error {
   }
 }
 
+const useBrevo = () => Boolean(process.env.BREVO_API_KEY);
+const BREVO_URL = 'https://api.brevo.com/v3';
+
 const isEmailConfigured = () =>
-  Boolean(process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS);
+  useBrevo() || Boolean(process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS);
+
+/** "Nombre <correo@x.com>" -> { name, email } */
+function parseFrom(value) {
+  const raw = String(value || process.env.EMAIL_USER || '').trim();
+  const m = raw.match(/^\s*"?([^"<]*)"?\s*<([^>]+)>\s*$/);
+  return m ? { name: m[1].trim() || undefined, email: m[2].trim() } : { email: raw };
+}
+
+async function brevoRequest(path, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`${BREVO_URL}${path}`, {
+      ...options,
+      headers: { 'api-key': process.env.BREVO_API_KEY, accept: 'application/json', 'content-type': 'application/json' },
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const isDevFallbackEnabled = () =>
   process.env.NODE_ENV !== 'production' && process.env.EMAIL_DEV_FALLBACK === 'true';
@@ -83,7 +114,22 @@ async function verifyEmailTransport() {
       'El servicio de correo no está configurado en el servidor (EMAIL_HOST, EMAIL_USER y EMAIL_PASS).'
     );
   }
-  if (Date.now() - lastVerifiedAt < VERIFY_CACHE_MS) return { ok: true, mode: 'smtp' };
+  if (Date.now() - lastVerifiedAt < VERIFY_CACHE_MS) return { ok: true, mode: useBrevo() ? 'brevo' : 'smtp' };
+  if (useBrevo()) {
+    let r;
+    try {
+      r = await brevoRequest('/account');
+    } catch (err) {
+      console.error('❌ Brevo no disponible:', err.message);
+      throw new EmailError('EMAIL_TRANSPORT_ERROR', 'No fue posible conectar con el servicio de correo.', err);
+    }
+    if (!r.ok) {
+      console.error('❌ Brevo rechazó la clave API:', r.status, r.data && r.data.message);
+      throw new EmailError('EMAIL_TRANSPORT_ERROR', 'El servicio de correo rechazó las credenciales.');
+    }
+    lastVerifiedAt = Date.now();
+    return { ok: true, mode: 'brevo' };
+  }
   try {
     await getTransporter().verify();
     lastVerifiedAt = Date.now();
@@ -106,6 +152,27 @@ async function sendMail({ to, subject, html, text }) {
       'EMAIL_NOT_CONFIGURED',
       'El servicio de correo no está configurado en el servidor (EMAIL_HOST, EMAIL_USER y EMAIL_PASS).'
     );
+  }
+
+  if (useBrevo()) {
+    let r;
+    try {
+      r = await brevoRequest('/smtp/email', {
+        method: 'POST',
+        body: JSON.stringify({ sender: parseFrom(process.env.EMAIL_FROM), to: [{ email: to }], subject, htmlContent: html, textContent: text }),
+      });
+    } catch (err) {
+      lastVerifiedAt = 0;
+      console.error('❌ Error enviando correo (Brevo):', err.message);
+      throw new EmailError('EMAIL_TRANSPORT_ERROR', 'El servicio de correo no pudo enviar el mensaje.', err);
+    }
+    if (!r.ok) {
+      lastVerifiedAt = 0;
+      console.error('❌ Brevo no envió el correo:', r.status, r.data && (r.data.code || ''), r.data && r.data.message);
+      throw new EmailError('EMAIL_REJECTED', 'El servicio de correo no aceptó el mensaje.');
+    }
+    lastVerifiedAt = Date.now();
+    return { sent: true, mode: 'brevo', messageId: r.data.messageId };
   }
 
   let info;
@@ -196,4 +263,5 @@ module.exports = {
   sendPasswordResetEmail,
   sendOtpEmail,
   resetTransporter,
+  parseFrom,
 };

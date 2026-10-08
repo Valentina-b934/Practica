@@ -55,8 +55,9 @@ function handleAuthFlowError(res, err, emailFailMessage) {
   }
   if (err instanceof EmailError) {
     res.status(503);
-    const e = new Error(emailFailMessage);
+    const e = new Error(emailFailMessage || 'No pudimos enviar el correo. Intenta de nuevo en unos minutos.');
     e.code = err.code;
+    e.expose = true;
     throw e;
   }
   throw err;

@@ -40,7 +40,9 @@ const errorHandler = (err, req, res, next) => {
 
   if (statusCode >= 500) {
     console.error(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl.split('?')[0]} ->`, err);
-    if (process.env.NODE_ENV === 'production') message = 'Error interno del servidor. Intenta de nuevo más tarde.';
+    // Los errores marcados con expose=true (por ejemplo "no pudimos enviar el
+    // correo", 503) ya traen un mensaje pensado para el usuario y se muestran.
+    if (process.env.NODE_ENV === 'production' && !err.expose) message = 'Error interno del servidor. Intenta de nuevo más tarde.';
   }
 
   res.status(statusCode).json({
