@@ -28,8 +28,9 @@
 const Item = require('../models/Item');
 const Match = require('../models/Match');
 const Notification = require('../models/Notification');
-const { cosineSimilarity, fieldSimilarity } = require('./textAnalysis');
-const { imageSimilarity } = require('./imageAnalysis');
+const { cosineSimilarity, fieldSimilarity, placeSimilarity, normalizeText } = require('./textAnalysis');
+const { imageSimilarity, namedColorSimilarity } = require('./imageAnalysis');
+const { embeddingSimilarity } = require('./visualModel');
 
 // Umbral de coincidencia: una coincidencia es valida solo si su porcentaje
 // es ESTRICTAMENTE MAYOR que 70 % (ver utils/matchRules.js). El calculo del
@@ -37,6 +38,10 @@ const { imageSimilarity } = require('./imageAnalysis');
 const { MATCH_THRESHOLD_PERCENT, isValidMatchScore } = require('../utils/matchRules');
 const THRESHOLD = MATCH_THRESHOLD_PERCENT / 100;
 
+// Cuando las dos fotos pasaron por la red neuronal, la FOTO es el criterio
+// principal: reconoce el mismo objeto aunque la foto sea de otro angulo,
+// y quien lo encontro casi nunca escribe muchos detalles.
+const WEIGHTS_WITH_VISUAL_AI = { text: 0.15, image: 0.40, category: 0.12, color: 0.08, brand: 0.07, location: 0.18 };
 const WEIGHTS_WITH_IMAGE = { text: 0.22, image: 0.25, category: 0.13, color: 0.10, brand: 0.10, location: 0.20 };
 const WEIGHTS_WITHOUT_IMAGE = { text: 0.30, category: 0.18, color: 0.14, brand: 0.13, location: 0.25 };
 const CATEGORY_MISMATCH_PENALTY = 0.8; // penalizacion moderada, no descarta el match por si sola
@@ -50,13 +55,50 @@ const CATEGORY_MISMATCH_PENALTY = 0.8; // penalizacion moderada, no descarta el 
  */
 function locationSimilarity(itemA, itemB) {
   const sameCity = String(itemA.city) === String(itemB.city);
-  const placeScore = fieldSimilarity(itemA.place, itemB.place);
+  const placeScore = placeSimilarity(itemA.place, itemB.place);
   return sameCity ? 0.7 + placeScore * 0.3 : placeScore * 0.4;
+}
+
+const hasValue = (v) => normalizeText(v).trim() !== '';
+
+/**
+ * Similitud de COLOR. Si los dos reportes escribieron el color, se
+ * comparan los textos. Si solo uno lo escribio (lo normal: quien
+ * encuentra casi nunca lo pone), se compara ese color escrito con el
+ * color del objeto en la FOTO del otro reporte. Devuelve null si no
+ * hay con que comparar; en ese caso el color no se evalua.
+ */
+function colorSimilarityFor(itemA, itemB) {
+  const textA = hasValue(itemA.color);
+  const textB = hasValue(itemB.color);
+  if (textA && textB) return fieldSimilarity(itemA.color, itemB.color);
+  if (textA) return namedColorSimilarity(itemA.color, itemB.imageColorProfile);
+  if (textB) return namedColorSimilarity(itemB.color, itemA.imageColorProfile);
+  return null;
+}
+
+/**
+ * Pesos a usar para este par. Igual que con la foto: si el color o la
+ * marca no se pueden comparar, ese criterio no se evalua y su peso se
+ * reparte entre los demas. Asi el formulario rapido de "encontrado"
+ * (donde color y marca son opcionales) no pierde puntos por dejarlos
+ * vacios.
+ */
+function weightsFor(itemA, itemB, hasImages, colorScore) {
+  const visualAi = hasImages && embeddingSimilarity(itemA.imageEmbedding, itemB.imageEmbedding) !== null;
+  const base = visualAi ? WEIGHTS_WITH_VISUAL_AI : hasImages ? WEIGHTS_WITH_IMAGE : WEIGHTS_WITHOUT_IMAGE;
+  const w = { ...base };
+  if (colorScore === null) w.color = 0;
+  if (!hasValue(itemA.brand) || !hasValue(itemB.brand)) w.brand = 0;
+  const total = Object.values(w).reduce((s, v) => s + v, 0);
+  Object.keys(w).forEach((k) => (w[k] /= total));
+  return w;
 }
 
 function calculateScore(itemA, itemB) {
   const textScore = cosineSimilarity(itemA.textVector, itemB.textVector);
-  const colorScore = fieldSimilarity(itemA.color, itemB.color);
+  const colorResult = colorSimilarityFor(itemA, itemB);
+  const colorScore = colorResult === null ? 0.5 : colorResult;
   const brandScore = fieldSimilarity(itemA.brand, itemB.brand);
   const locationScore = locationSimilarity(itemA, itemB);
   const sameCategory = String(itemA.category) === String(itemB.category);
@@ -64,7 +106,7 @@ function calculateScore(itemA, itemB) {
   const hasImages = Boolean(itemA.imageHash && itemB.imageHash);
   const imgScore = hasImages ? imageSimilarity(itemA, itemB) : 0;
 
-  const w = hasImages ? WEIGHTS_WITH_IMAGE : WEIGHTS_WITHOUT_IMAGE;
+  const w = weightsFor(itemA, itemB, hasImages, colorResult);
 
   let base =
     textScore * w.text +
@@ -100,7 +142,7 @@ async function findMatchesForItem(newItem) {
     type: oppositeType,
     status: { $in: ['activo', 'con_coincidencias'] },
     'moderation.status': 'aprobado',
-  });
+  }).select('+imageEmbedding');
 
   const createdMatches = [];
 
@@ -147,7 +189,7 @@ async function findMatchesForItem(newItem) {
   }
 
   if (createdMatches.length > 0) {
-    await Item.findByIdAndUpdate(newItem._id, { status: 'con_coincidencias' });
+    await Item.updateOne({ _id: newItem._id }, { status: 'con_coincidencias' });
   }
 
   return createdMatches;
@@ -161,7 +203,7 @@ async function findMatchesForItem(newItem) {
  * se dispara automaticamente al CREAR un reporte.
  */
 async function rescanAllMatches() {
-  const items = await Item.find({ 'moderation.status': 'aprobado' });
+  const items = await Item.find({ 'moderation.status': 'aprobado' }).select('+imageEmbedding');
   let totalNewMatches = 0;
   for (const item of items) {
     const matches = await findMatchesForItem(item);

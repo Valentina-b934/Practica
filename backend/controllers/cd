@@ -9,7 +9,6 @@ const Category = require('../models/Category');
 const Institution = require('../models/Institution');
 const { buildTextVector } = require('../services/textAnalysis');
 const { computeImageHash, computeColorProfile, isSameImage } = require('../services/imageAnalysis');
-const { computeImageEmbedding } = require('../services/visualModel');
 const { findMatchesForItem } = require('../services/aiMatching');
 const { removeUploadedFile } = require('../middleware/upload');
 const { cleanString, isValidObjectId, escapeRegex } = require('../utils/validators');
@@ -137,7 +136,6 @@ const createItem = (type) =>
       const buffer = req.file.buffer || fs.readFileSync(req.file.path);
       const imageHash = await computeImageHash(buffer);
       const imageColorProfile = await computeColorProfile(buffer);
-      const imageEmbedding = await computeImageEmbedding(buffer); // red neuronal (vacio si no esta disponible)
 
       if (!imageHash) {
         // La imagen se subio pero no se pudo procesar (archivo corrupto,
@@ -182,7 +180,6 @@ const createItem = (type) =>
         imageUrl,
         imageHash,
         imageColorProfile,
-        imageEmbedding,
       });
 
       // Vector de texto generado por IA (PLN)
@@ -197,7 +194,6 @@ const createItem = (type) =>
       delete responseItem.textVector;
       delete responseItem.imageHash;
       delete responseItem.imageColorProfile;
-      delete responseItem.imageEmbedding;
 
       res.status(201).json({
         item: responseItem,

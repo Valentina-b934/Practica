@@ -28,7 +28,10 @@ const itemSchema = new mongoose.Schema(
     // --- Campos generados por la IA ---
     textVector: { type: Map, of: Number, default: {} }, // bolsa de palabras ponderada (TF)
     imageHash: { type: String, default: '' }, // hash perceptual (pHash) de la imagen
-    imageColorProfile: { type: [Number], default: [] }, // histograma de color simplificado
+    imageColorProfile: { type: [Number], default: [] }, // color del objeto en la foto
+    // Huella visual de la red neuronal (services/visualModel.js). select:false
+    // para que nunca se envie en las respuestas de la API.
+    imageEmbedding: { type: [Number], default: [], select: false },
 
     status: {
       type: String,

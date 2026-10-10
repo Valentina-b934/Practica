@@ -18,6 +18,10 @@ const STOPWORDS = new Set([
   'y', 'o', 'en', 'con', 'por', 'para', 'que', 'se', 'su', 'sus', 'mi', 'mis',
   'lo', 'es', 'era', 'fue', 'a', 'ante', 'bajo', 'como', 'muy', 'esta', 'este',
   'esa', 'ese', 'me', 'tengo', 'tenia', 'perdi', 'encontre', 'objeto',
+  // Palabras que solo dicen si es perdido o encontrado (el formulario
+  // rapido de "encontrado" las pone en el titulo automatico): no ayudan
+  // a saber si es el mismo objeto.
+  'perdido', 'perdida', 'perdidos', 'perdidas', 'encontrado', 'encontrada', 'encontrados', 'encontradas',
 ]);
 
 /**
@@ -106,6 +110,26 @@ function fieldSimilarity(valueA, valueB) {
 }
 
 /**
+ * Similitud del LUGAR. Quien encontro el objeto suele escribir menos
+ * (o algo distinto) que el dueño: "barrio nuevo dia" vs "por el centro
+ * comercial de nuevo dia". Por eso se mide cuanto del lugar MAS CORTO
+ * aparece en el otro, ignorando palabras vacias. Si falta en alguno,
+ * devuelve un valor neutral (0.5).
+ */
+function placeSimilarity(placeA, placeB) {
+  const words = (v) => normalizeText(v).split(/\s+/).filter((w) => w.length > 2 && !STOPWORDS.has(w));
+  const a = words(placeA);
+  const b = words(placeB);
+  if (!a.length || !b.length) return 0.5;
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  const total = shorter.reduce((sum, ws) => {
+    const best = Math.max(...longer.map((wl) => (ws === wl ? 1 : natural.JaroWinklerDistance(ws, wl))));
+    return sum + (best >= 0.9 ? best : 0); // solo cuentan palabras realmente iguales o casi iguales
+  }, 0);
+  return total / shorter.length;
+}
+
+/**
  * Similitud coseno entre dos vectores de palabras, con tolerancia
  * a variaciones ortograficas (fuzzy match) usando Jaro-Winkler.
  */
@@ -136,4 +160,4 @@ function cosineSimilarity(vecA = {}, vecB = {}) {
   return Math.min(Math.max(sim, 0), 1);
 }
 
-module.exports = { buildTextVector, cosineSimilarity, normalizeText, fieldSimilarity, toPlainObject };
+module.exports = { buildTextVector, cosineSimilarity, normalizeText, fieldSimilarity, placeSimilarity, toPlainObject };
